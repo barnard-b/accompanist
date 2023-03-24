@@ -18,6 +18,7 @@ package com.google.accompanist.web
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Bundle
 import android.view.ViewGroup.LayoutParams
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -27,6 +28,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
@@ -35,6 +37,9 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.mapSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.snapshots.SnapshotStateList
@@ -89,12 +94,23 @@ fun WebView(
 ) {
     var webView by remember { mutableStateOf<WebView?>(null) }
 
+    val currentOnDispose by rememberUpdatedState(onDispose)
+    DisposableEffect(webView) {
+        onDispose {
+            webView?.let {
+                currentOnDispose(it)
+            }
+        }
+    }
+
     BackHandler(captureBackPresses && navigator.canGoBack) {
         webView?.goBack()
     }
 
     LaunchedEffect(webView, navigator) {
-        with(navigator) { webView?.handleNavigationEvents() }
+        with(navigator) {
+            webView?.handleNavigationEvents()
+        }
     }
 
     LaunchedEffect(webView, state) {
@@ -114,6 +130,10 @@ fun WebView(
                         content.encoding,
                         content.historyUrl
                     )
+                }
+
+                is WebContent.NavigatorOnly -> {
+
                 }
             }
         }
@@ -147,16 +167,22 @@ fun WebView(
             parentLayout
         },
         onReset = { parentFrame ->
-            webView = null
-            onReset(parentFrame.children.first() as WebView)
+            val wv = parentFrame.children.first() as WebView
+//            state.webViewSavedState = Bundle().apply { wv.saveState(this) }
+//            webView = null
+            onReset(wv)
         },
-        onRelease = { parentFrame ->
-            webView = null
-            onDispose(parentFrame.children.first() as WebView)
+        onRelease = { _ ->
+//            val wv = parentFrame.children.first() as WebView
+//            state.webViewSavedState = Bundle().apply { wv.saveState(this) }
+//            webView = null
+//
+//            onDispose(wv)
         },
         modifier = modifier,
         update = {
-            webView = it.children.first() as WebView
+            val wv = it.children.first() as WebView
+            webView = wv
         }
     )
 }
@@ -258,8 +284,11 @@ sealed class WebContent {
         return when (this) {
             is Url -> url
             is Data -> baseUrl
+            is NavigatorOnly -> throw IllegalStateException("Unsupported")
         }
     }
+
+    object NavigatorOnly: WebContent()
 }
 
 internal fun WebContent.withUrl(url: String) = when (this) {
@@ -363,9 +392,11 @@ class WebViewNavigator(private val coroutineScope: CoroutineScope) {
             val encoding: String? = "utf-8",
             val historyUrl: String? = null
         ) : NavigationEvent
+
+        data class RestoreState(val bundle: Bundle): NavigationEvent
     }
 
-    private val navigationEvents: MutableSharedFlow<NavigationEvent> = MutableSharedFlow()
+    private val navigationEvents: MutableSharedFlow<NavigationEvent> = MutableSharedFlow(replay = 1)
 
     // Use Dispatchers.Main to ensure that the webview methods are called on UI thread
     internal suspend fun WebView.handleNavigationEvents(): Nothing = withContext(Dispatchers.Main) {
@@ -385,6 +416,9 @@ class WebViewNavigator(private val coroutineScope: CoroutineScope) {
 
                 is NavigationEvent.LoadUrl -> {
                     loadUrl(event.url, event.additionalHttpHeaders)
+                }
+                is NavigationEvent.RestoreState -> {
+                    restoreState(event.bundle)
                 }
             }
         }
@@ -460,6 +494,10 @@ class WebViewNavigator(private val coroutineScope: CoroutineScope) {
     fun stopLoading() {
         coroutineScope.launch { navigationEvents.emit(NavigationEvent.StopLoading) }
     }
+
+    fun restoreState(bundle: Bundle) = coroutineScope.launch {
+        navigationEvents.emit(NavigationEvent.RestoreState(bundle))
+    }
 }
 
 /**
@@ -534,3 +572,29 @@ fun rememberWebViewStateWithHTMLData(
             data, baseUrl, encoding, mimeType, historyUrl
         )
     }
+
+@Composable
+fun rememberSaveableWebViewNavigatorState(): WebViewState =
+    rememberSaveable(saver = WebStateSaver) {
+        WebViewState(WebContent.NavigatorOnly)
+    }
+
+val WebStateSaver = run {
+    val pageTitleKey = "pagetitle"
+    val lastLoadedUrlKey = "lastloaded"
+
+    mapSaver(
+        save = {
+            mapOf(
+                pageTitleKey to it.pageTitle,
+                lastLoadedUrlKey to it.lastLoadedUrl
+            )
+        },
+        restore = {
+            WebViewState(WebContent.NavigatorOnly).apply {
+                this.pageTitle = it[pageTitleKey] as String?
+                this.lastLoadedUrl = it[lastLoadedUrlKey] as String?
+            }
+        }
+    )
+}
